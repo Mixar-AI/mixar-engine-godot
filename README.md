@@ -54,6 +54,39 @@ after `initialize`).
 | `remove_node` | Removes a node from the open scene (undo) |
 | `project_setting` | Reads any setting; in owned projects sets input actions (`{keys, mouse}`), autoloads, the main scene, window, physics, environment defaults and layer names |
 | `build_info` | The last web build's files and folder, for the Mixar desktop to upload a share |
+| `list_toolsets` / `describe_toolset` / `call_tool` | The editor toolsets below (same shape as Epic's Unreal server): list them, get one's tools with JSON input schemas, run one |
+
+## Editor toolsets
+
+Reach into the whole editor through Godot's own reflection (ClassDB,
+EditorInterface, EditorUndoRedoManager). `call_tool` takes `toolset_name`,
+`tool_name` (or the full `godot.scene.set_properties` with an empty
+`toolset_name`) and `arguments`. Units and axes are Godot's own (Y up, metres);
+node paths are relative to the edited scene's root (`.` is the root).
+
+| Toolset | Tools |
+| --- | --- |
+| `godot.classes` | `class_info(class_name, sections?, inherited?, filter?)` (parent chain, properties with types/hints/defaults, methods with typed args, signals, constants, enums; engine classes and the project's `class_name` scripts), `search_classes(query, base?, max_results?)` |
+| `godot.scene` | On the open scene, each call one undo step, never saved: `get_nodes(root?, depth?, filter_type?, properties?, max_nodes?)`, `get_properties(node, names?)`, `set_properties(edits: [{node, property, value}])`, `call_method(node, method, args?)` (not undoable), `add_nodes(nodes: [{parent?, type \| scene, name, properties?}])`, `remove_nodes(nodes)`, `reparent(node, parent, keep_global_transform?, index?)`, `duplicate(node, name?, parent?)`, `connect_signal(node, signal, target, method, binds?, deferred?, one_shot?)`, `disconnect_signal(node, signal, target, method)`, `edit_instance(node, editable?)` |
+| `godot.resources` | `create_resource(type, path, properties?, overwrite?)` (a `.tres` under `res://mixar/`), `get_resource(path, properties?)`, `set_resource_properties(path, edits)` (under `res://mixar/`; saves the file), `list_resources(type?, dir?, max_results?)` |
+| `godot.files` | `read_file(path, start_line?, max_lines?)`, `list_files(dir?, pattern?, max_files?)` anywhere in `res://`; `write_file(path, content)`, `move_file(from, to, overwrite?)`, `delete_file(path)` under `res://mixar/` only (checked as `write_file` is; `@tool` scripts refused); `rescan()` |
+| `godot.editor` | `open_scene(scene)`, `save_scene(scene?)`, `save_all()`, `select(nodes)`, `capture_editor(view?, max_width?)`, `editor_state()`, `run_script(source)` |
+
+Values in are plain JSON coerced to the property's type (`[x, y, z]` vectors,
+`[r, g, b, a]` or `"#rrggbb"` colours, `[[x], [y], [z], [origin]]` transforms,
+enum names), `"res://..."` for a resource, `{"$new": "StandardMaterial3D",
+"properties": {...}}` for a new embedded resource, or `{"$godot": "<var_to_str
+literal>"}` for anything else. Values out are JSON where JSON can say it,
+`{"$godot": ...}` otherwise; resources come back as their path, or
+`{"$resource": class, "properties"}` when embedded; long lists say `truncated`.
+
+Batch tools are all or nothing: one bad edit and none apply, with an error
+naming what to do instead. `run_script` runs a GDScript `func run(editor:
+EditorInterface)` once in the editor: it is compiled first (errors come back and
+nothing runs), its printed lines and errors come back with its result, and it
+is not undoable. It runs only when the call carries `approved_by_user: true`,
+which the Mixar backend sets after the user approves that run. The plugin-mode
+rules below hold for every toolset.
 
 `new_scene` takes a `template` that wraps the level in a game: a player, a game
 manager, a HUD and the input map. Space jumps in all three:
@@ -114,7 +147,8 @@ extras. Godot reads the extras as node metadata.
 ## Test
 
 ```sh
-python3 test/run_e2e.py --godot /path/to/Godot            # headless editor and game (95 checks: plays levels to a win, scripted gameplay, plugin mode)
+python3 test/run_e2e.py --godot /path/to/Godot            # headless editor and game (108 checks: plays levels to a win, scripted gameplay, plugin mode)
+python3 test/run_toolsets_e2e.py --godot /path/to/Godot   # every editor toolset tool, undo, refusals and plugin mode (117 checks)
 python3 test/run_e2e.py --godot /path/to/Godot --windowed-game   # also checks a real frame
 ```
 

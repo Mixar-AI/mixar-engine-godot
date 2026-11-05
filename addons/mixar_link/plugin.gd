@@ -82,6 +82,8 @@ func _exit_tree() -> void:
 	if _log != null:
 		OS.remove_logger(_log)
 		_log = null
+	if _tools != null:
+		_tools.close()
 	_tools = null
 
 

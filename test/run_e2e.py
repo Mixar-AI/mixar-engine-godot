@@ -441,7 +441,8 @@ def main() -> int:
             return 1
         time.sleep(0.5)
         info = json.load(open(discovery))
-        check(oct(os.stat(discovery).st_mode & 0o777) == "0o600", "discovery file is owner-only",
+        # Windows has no POSIX mode bits (the file lives in the user's own profile).
+        check(os.name == "nt" or oct(os.stat(discovery).st_mode & 0o777) == "0o600", "discovery file is owner-only",
               oct(os.stat(discovery).st_mode & 0o777))
         check(info["engine"] == "godot" and info["port"] >= 9890 and len(info["token"]) == 48,
               "discovery carries engine, port, token")
