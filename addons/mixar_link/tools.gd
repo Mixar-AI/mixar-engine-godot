@@ -8,7 +8,7 @@ extends RefCounted
 ## Mixar works in: Blender (x, y, z) is Godot (x, z, -y), and a yaw about
 ## Blender's Z is the same angle about Godot's Y.
 
-const ADAPTER_VERSION := "0.4.0"
+const ADAPTER_VERSION := "0.5.0"
 ## Project settings the STUDIO sets (never the agent): "owned" (default, a
 ## Mixar-made game) or "plugin" (an existing project: Mixar keeps to
 ## res://mixar/, never edits project settings, and edits only levels under
@@ -17,6 +17,7 @@ const MODE_SETTING := "mixar_link/project_mode"
 const EDITABLE_SETTING := "mixar_link/editable_scenes"
 const MIXAR_DIR := "res://mixar"
 const Retarget := preload("res://addons/mixar_link/retarget.gd")
+const Toolsets := preload("res://addons/mixar_link/toolsets/registry.gd")
 const IMPORT_TIMEOUT_MS := 120000
 const PLAY_TIMEOUT_MS := 20000
 const FRAME_TIMEOUT_MS := 8000
@@ -40,12 +41,22 @@ const INPUT_ACTIONS := {
 var plugin: EditorPlugin
 var debugger: EditorDebuggerPlugin
 var log_buffer: Logger
+## The editor toolsets (godot.classes, .scene, .resources, .files, .editor).
+var toolsets: RefCounted
 
 
 func _init(p_plugin: EditorPlugin, p_debugger: EditorDebuggerPlugin, p_log: Logger) -> void:
 	plugin = p_plugin
 	debugger = p_debugger
 	log_buffer = p_log
+	toolsets = Toolsets.new(self)
+
+
+## Breaks the reference cycle with the toolsets when the plugin unloads.
+func close() -> void:
+	if toolsets != null:
+		toolsets.close()
+		toolsets = null
 
 
 # ---------------------------------------------------------------------------
@@ -100,7 +111,7 @@ func list_tools() -> Array:
 			{}),
 		_tool("build_info", "The last web build's files and its absolute folder (for the Mixar desktop to upload a share).",
 			{}),
-	]
+	] + toolsets.top_level_tools()
 
 
 func _tool(name: String, description: String, props: Dictionary, required: Array = []) -> Dictionary:
@@ -137,6 +148,9 @@ func call_tool(name: String, args: Dictionary) -> Dictionary:
 		"set_property": result = _set_property(args)
 		"build_web": result = await _build_web()
 		"build_info": result = _build_info()
+		"list_toolsets": result = toolsets.list_toolsets()
+		"describe_toolset": result = toolsets.describe_toolset(args)
+		"call_tool": result = await toolsets.call_tool(args)
 		_: return _err("Unknown tool: " + name)
 	if typeof(result) != TYPE_DICTIONARY:
 		return _err("%s failed inside Godot; see the Output panel." % name)
@@ -161,6 +175,7 @@ func _status() -> Dictionary:
 		"mixar_folder": MIXAR_DIR,
 		"log_seq": log_buffer.latest(),
 		"project_mode": _mode(),
+		"toolsets": true,
 	})
 
 
@@ -927,12 +942,13 @@ func _settings_refusal(what: String) -> String:
 	return "This project is in plugin mode (%s = \"plugin\"): Mixar does not change its project settings, so it cannot %s. Ask the user to do it in Project Settings." % [MODE_SETTING, what]
 
 
-## In plugin mode: why Mixar may not edit the open scene, else "".
-func _scene_refusal() -> String:
+## In plugin mode: why Mixar may not edit the open scene (or the scene at
+## `for_path`), else "".
+func _scene_refusal(for_path = null) -> String:
 	if _mode() != "plugin":
 		return ""
 	var root := EditorInterface.get_edited_scene_root()
-	var path := root.scene_file_path if root else ""
+	var path: String = String(for_path) if for_path != null else (root.scene_file_path if root else "")
 	if path.begins_with(MIXAR_DIR + "/"):
 		return ""
 	var listed: Array = Array(ProjectSettings.get_setting(EDITABLE_SETTING, PackedStringArray()))
