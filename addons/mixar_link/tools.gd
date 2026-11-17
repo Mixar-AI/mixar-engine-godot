@@ -22,6 +22,8 @@ const IMPORT_TIMEOUT_MS := 120000
 ## Idle frames an indexed package may stay unimported before the import counts as failed.
 const IMPORT_SETTLE_FRAMES := 30
 const MAX_IMPORT_SCANS := 5
+## Frames in a row the editor must be idle before the link scans or reimports.
+const IDLE_FRAMES := 3
 ## How many finished imports status lists.
 const RECENT_IMPORTS := 8
 const PLAY_TIMEOUT_MS := 20000
@@ -55,6 +57,14 @@ var _import_running: Dictionary = {}
 var _import_seq := 0
 var _recent_imports: Array = []
 var _scan_pending := false
+## Inside reimport_files(), from its resources_reimporting signal to its
+## resources_reimported one (ticks ms at its start; 0 outside), and the process
+## frame it ended in. is_importing() alone is not enough: reimport_files()
+## clears it, then runs frames again ("post-reimport operations") under the
+## same progress task, and a reimport started in one of those frames fails
+## ("Task 'reimport' already exists") and can crash the editor.
+var _reimport_started_ms := 0
+var _reimport_end_frame := -1
 
 
 func _init(p_plugin: EditorPlugin, p_debugger: EditorDebuggerPlugin, p_log: Logger) -> void:
@@ -62,13 +72,42 @@ func _init(p_plugin: EditorPlugin, p_debugger: EditorDebuggerPlugin, p_log: Logg
 	debugger = p_debugger
 	log_buffer = p_log
 	toolsets = Toolsets.new(self)
+	var fs := EditorInterface.get_resource_filesystem()
+	fs.resources_reimporting.connect(_on_reimporting)
+	fs.resources_reimported.connect(_on_reimported)
 
 
 ## Breaks the reference cycle with the toolsets when the plugin unloads.
 func close() -> void:
+	var fs := EditorInterface.get_resource_filesystem()
+	if fs.resources_reimporting.is_connected(_on_reimporting):
+		fs.resources_reimporting.disconnect(_on_reimporting)
+	if fs.resources_reimported.is_connected(_on_reimported):
+		fs.resources_reimported.disconnect(_on_reimported)
 	if toolsets != null:
 		toolsets.close()
 		toolsets = null
+
+
+func _on_reimporting(_files: PackedStringArray) -> void:
+	_reimport_started_ms = Time.get_ticks_msec()
+
+
+func _on_reimported(_files: PackedStringArray) -> void:
+	_reimport_started_ms = 0
+	_reimport_end_frame = Engine.get_process_frames()
+
+
+## True while the editor scans or imports, including the frames reimport_files()
+## runs after it clears is_importing(), and the frame it returns in.
+func fs_busy() -> bool:
+	var fs := EditorInterface.get_resource_filesystem()
+	if fs.is_scanning() or fs.is_importing():
+		return true
+	# A reimport that never reported its end (an importer error) stops counting after 10 min.
+	if _reimport_started_ms != 0 and Time.get_ticks_msec() - _reimport_started_ms < 600000:
+		return true
+	return Engine.get_process_frames() <= _reimport_end_frame
 
 
 # ---------------------------------------------------------------------------
@@ -296,27 +335,40 @@ func _run_import(ticket: Dictionary, src: String, folder: String, main: String, 
 	data["files_copied"] = moved
 	var wanted := _import_wanted(files, main)
 	var scans := 0
-	var idle_frames := 0
+	var reimported := false
+	var idle := 0
 	while Time.get_ticks_msec() < deadline:
-		if fs.is_scanning() or fs.is_importing():
-			idle_frames = 0
+		if fs_busy():
+			idle = 0
 		else:
+			idle += 1
 			# Checked only after our own scan: the index may still call the
 			# files that were just replaced valid.
 			var state := _import_state(dest_res, wanted)
 			if scans > 0 and state == "imported":
 				break
-			if scans == 0 or (state == "unindexed" and scans < MAX_IMPORT_SCANS):
-				# Ours, or again when a scan that was already running dropped ours.
-				fs.scan()
+			if scans == 0:
+				fs.scan()  # the editor is idle: wait_fs_idle() just said so
 				scans += 1
-				idle_frames = 0
-			else:
-				idle_frames += 1
-				if idle_frames > IMPORT_SETTLE_FRAMES:
-					break  # indexed, idle, still not valid: the importer failed
+				idle = 0
+			elif idle >= IDLE_FRAMES:
+				if state == "unindexed" and scans < MAX_IMPORT_SCANS:
+					# A scan that was already running dropped ours.
+					fs.scan()
+					scans += 1
+					idle = 0
+				elif state == "pending" and not reimported:
+					# Indexed but not imported: the editor's own reimport skipped
+					# them (it ran inside another one). One reimport_files() for
+					# the package; it sorts textures before the scene.
+					fs.reimport_files(_import_pending(dest_res, wanted))
+					reimported = true
+					idle = 0
+				elif idle > IMPORT_SETTLE_FRAMES:
+					break  # idle, and still not imported: the importer failed
 		await tree.process_frame
-	var imported := _import_state(dest_res, wanted) == "imported" and ResourceLoader.exists(main_res)
+	var state_now := _import_state(dest_res, wanted)
+	var imported := state_now == "imported" and ResourceLoader.exists(main_res)
 	data["imported"] = imported
 	data["main_scene"] = main_res if imported else ""
 	if imported:
@@ -335,32 +387,40 @@ func _run_import(ticket: Dictionary, src: String, folder: String, main: String, 
 				"skeleton": "%GeneralSkeleton", "note": "Bones take Godot's humanoid names (Hips, LeftUpperArm, ...); "
 				+ "a clip from any retargeted character plays on this one."}
 	data["seconds"] = snappedf((Time.get_ticks_msec() - t0) / 1000.0, 0.1)
-	if not imported:
+	if not imported and Time.get_ticks_msec() >= deadline:
 		data["error"] = "The package was copied but %s did not import within %d s; read log for the importer's errors." % [
 			main_res, IMPORT_TIMEOUT_MS / 1000]
+	elif not imported:
+		data["error"] = "The package was copied but the editor could not import %s; read log for the importer's errors." % (
+			", ".join(_import_pending(dest_res, wanted)) if state_now == "pending" else main_res)
 	return data
 
 
-## Waits a frame at a time until the editor is neither scanning nor importing:
-## true then (the caller may scan or reimport in this same frame), false at
-## `deadline_ms`. Every scan or reimport the link starts goes through this, so
+## Waits a frame at a time until the editor has been neither scanning nor
+## importing for `idle_frames` frames in a row: true then (the caller may scan
+## or reimport in this same frame), false at `deadline_ms`. The idle frames
+## let the editor's own follow-up work go first (after a scene import,
+## textures found used in 3D are reimported on a later frame). Every scan or reimport the link starts goes through this, so
 ## none starts inside a running import (reimport_files() is not reentrant, and
 ## its progress dialog runs frames while it imports).
-func wait_fs_idle(deadline_ms: int) -> bool:
-	var fs := EditorInterface.get_resource_filesystem()
+func wait_fs_idle(deadline_ms: int, idle_frames := IDLE_FRAMES) -> bool:
 	var tree := plugin.get_tree()
-	while fs.is_scanning() or fs.is_importing():
+	var idle := 0
+	while true:
+		idle = 0 if fs_busy() else idle + 1
+		if idle >= idle_frames:
+			return true
 		if Time.get_ticks_msec() > deadline_ms:
 			return false
 		await tree.process_frame
-	return true
+	return false
 
 
 ## A scan now if the editor is idle, else as soon as it is (never inside a
 ## running import). For tools that change files and do not wait for the scan.
 func request_scan() -> void:
 	var fs := EditorInterface.get_resource_filesystem()
-	if not fs.is_scanning() and not fs.is_importing():
+	if not fs_busy():
 		fs.scan()
 		return
 	if _scan_pending:
@@ -368,7 +428,7 @@ func request_scan() -> void:
 	_scan_pending = true
 	await wait_fs_idle(Time.get_ticks_msec() + IMPORT_TIMEOUT_MS)
 	_scan_pending = false
-	if not fs.is_scanning() and not fs.is_importing():
+	if not fs_busy():
 		fs.scan()
 
 
@@ -1269,6 +1329,19 @@ static func _import_wanted(files: Array, main: String) -> Array:
 	for rel in files:
 		if rel == main or String(rel).get_extension().to_lower() in textures:
 			out.append(rel)
+	return out
+
+
+## The wanted files of res://mixar/<folder>/ that are indexed but not imported.
+static func _import_pending(dest_res: String, wanted: Array) -> PackedStringArray:
+	var fs := EditorInterface.get_resource_filesystem()
+	var out := PackedStringArray()
+	for rel in wanted:
+		var path := dest_res.path_join(rel)
+		var dir := fs.get_filesystem_path(path.get_base_dir())
+		var idx := dir.find_file_index(path.get_file()) if dir != null else -1
+		if idx >= 0 and (not dir.get_file_import_is_valid(idx) or not FileAccess.file_exists(path + ".import")):
+			out.append(path)
 	return out
 
 

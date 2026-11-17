@@ -169,7 +169,7 @@ func _list(args: Dictionary):
 		if await t.wait_fs_idle(t0 + 30000):
 			fs.scan()
 		await tree.process_frame
-		while (fs.is_scanning() or fs.is_importing()) and Time.get_ticks_msec() - t0 < 30000:
+		while t.fs_busy() and Time.get_ticks_msec() - t0 < 30000:
 			await tree.process_frame
 		start = fs.get_filesystem_path(dir)
 	if start == null:

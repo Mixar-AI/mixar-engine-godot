@@ -64,11 +64,15 @@ time, in the order they arrive:
 
 1. The call is checked (folder name, manifest), then queued.
 2. The package is copied into `.godot/mixar_link/staging/`, which the editor never scans.
-3. When its turn comes and the editor is neither scanning nor importing, every file
+3. When its turn comes and the editor has been idle for a few frames (not scanning, not
+   importing, and not in the frames `reimport_files()` runs after it clears
+   `is_importing()`), every file
    is renamed into `res://mixar/<folder>/` in one frame, textures first and the main
    file last, so the importer never reads a half-written file.
 4. One scan imports the package. Its single `reimport_files()` runs in importer order,
-   so textures are imported before the scene that uses them.
+   so textures are imported before the scene that uses them. If the editor's own
+   reimport skipped files, the link reimports what is left in one `reimport_files()`
+   call, while the editor is idle.
 5. The call answers when the main file and every texture are imported. A rig's
    retarget reimport runs only while the editor is idle.
 
@@ -172,6 +176,7 @@ python3 test/run_e2e.py --godot /path/to/Godot            # headless editor and 
 python3 test/run_toolsets_e2e.py --godot /path/to/Godot   # every editor toolset tool, undo, refusals and plugin mode (117 checks)
 python3 test/run_e2e.py --godot /path/to/Godot --windowed-game   # also checks a real frame
 python3 test/run_concurrent_import_e2e.py --godot /path/to/Godot   # simultaneous imports (same folder twice, a rig): no overlap, no corrupt read, no crash
+python3 test/run_concurrent_import_e2e.py --godot /path/to/Godot --windowed --tex-size 4096   # the same with an editor window (its progress dialog runs frames mid-import, the crash's path)
 ```
 
 ## License

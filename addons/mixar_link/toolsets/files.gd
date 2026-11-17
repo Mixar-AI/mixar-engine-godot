@@ -146,6 +146,6 @@ func _rescan():
 	if await t.wait_fs_idle(t0 + 60000):
 		fs.scan()
 	await tree.process_frame
-	while (fs.is_scanning() or fs.is_importing()) and Time.get_ticks_msec() - t0 < 60000:
+	while t.fs_busy() and Time.get_ticks_msec() - t0 < 60000:
 		await tree.process_frame
 	return ok({"scanning": fs.is_scanning(), "seconds": snappedf((Time.get_ticks_msec() - t0) / 1000.0, 0.1)})
