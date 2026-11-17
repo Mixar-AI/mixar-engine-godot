@@ -139,9 +139,50 @@ def imported(project: str, folder: str, files: list[str]) -> list[str]:
     return missing
 
 
+class _Running:
+    """A running editor we did not start: alive while its pid is."""
+
+    def __init__(self, pid: int):
+        self.pid, self.returncode = pid, None
+
+    def poll(self):
+        try:
+            os.kill(self.pid, 0)
+            return None
+        except ProcessLookupError:
+            self.returncode = "gone"
+            return self.returncode
+        except PermissionError:
+            return None
+
+
+def attach(project: str):
+    """(process, Client, a no-op log) for the running editor that has `project` open: found
+    through ~/.mixar/engine-link, and only when its res://project.godot is this folder's own
+    (never another editor on the same machine)."""
+    import glob
+    want = open(os.path.join(project, "project.godot"), errors="replace").read()
+    for path in sorted(glob.glob(os.path.expanduser("~/.mixar/engine-link/godot-*.json"))):
+        try:
+            info = json.load(open(path))
+            client = run_e2e.Client(info["port"], info["token"])
+            client.initialize()
+            r = client.call("read_file", {"path": "res://project.godot"}, timeout=10)
+        except Exception:
+            continue
+        sc = r.get("structuredContent") or {}
+        if not r.get("isError") and sc.get("content", sc.get("text")) == want:
+            return _Running(int(info["pid"])), client, open(os.devnull, "w")
+    return _Running(0), None, open(os.devnull, "w")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--godot", required=True)
+    ap.add_argument("--godot", help="the Godot editor binary to start (not with --attach)")
+    ap.add_argument("--attach", metavar="PROJECT_DIR",
+                    help="use the editor already running on PROJECT_DIR (found by its discovery file in "
+                         "~/.mixar/engine-link), e.g. a cloud workstation's; imports go to res://mixar/zzLinkTest*")
+    ap.add_argument("--editor-log", help="with --attach: that editor's own output file, checked at the end")
     ap.add_argument("--rounds", type=int, default=3)
     ap.add_argument("--tex-size", type=int, default=2048, help="texture edge in pixels (2048 = a 12 MB PNG)")
     ap.add_argument("--keep", action="store_true")
@@ -149,24 +190,35 @@ def main() -> int:
     ap.add_argument("--windowed", action="store_true",
                     help="run the editor with a window (its progress dialog runs frames during an import)")
     args = ap.parse_args()
+    if bool(args.godot) == bool(args.attach):
+        ap.error("give --godot (start an editor) or --attach (use a running one)")
 
     tmp = tempfile.mkdtemp(prefix="mixar-link-concurrent-")
     home, project, exports = (os.path.join(tmp, d) for d in ("home", "project", "Mixar Exports"))
-    for d in (home, project, exports):
+    for d in (home, exports):
         os.makedirs(d)
-    shutil.copytree(os.path.join(ROOT, "addons"), os.path.join(project, "addons"))
-    with open(os.path.join(project, "project.godot"), "w") as fh:
-        fh.write(run_e2e.PROJECT_GODOT.replace("[autoload]\n\nTestPrinter=\"*res://test_printer.gd\"\n", ""))
-    names = ["RubbleOperator", "Crate", "Barrel"]
+    if args.attach:
+        project = os.path.abspath(args.attach)
+    else:
+        os.makedirs(project)
+        shutil.copytree(os.path.join(ROOT, "addons"), os.path.join(project, "addons"))
+        with open(os.path.join(project, "project.godot"), "w") as fh:
+            fh.write(run_e2e.PROJECT_GODOT.replace("[autoload]\n\nTestPrinter=\"*res://test_printer.gd\"\n", ""))
+    p = "zzLinkTest" if args.attach else ""  # never a real asset's folder in someone's project
+    names = [p + "RubbleOperator", p + "Crate", p + "Barrel"]
     packages = {n: make_package(exports, n, args.tex_size) for n in names}
     files = {n: [n + ".glb", f"textures/{n}_Body_basecolor.001.png", f"textures/{n}_Body_normal.001.png"]
              for n in names}
     # A Tripo rig: its import retargets, which reimports the GLB (the reimport_files() call).
-    packages["Hero"] = run_e2e.humanoid_package(exports, "Hero", "tripo", wave=False)
-    files["Hero"] = ["Hero.glb"]
+    hero_name = p + "Hero"
+    packages[hero_name] = run_e2e.humanoid_package(exports, hero_name, "tripo", wave=False)
+    files[hero_name] = [hero_name + ".glb"]
 
     log_path = os.path.join(tmp, "godot.log")
-    if args.windowed:  # launch() is always headless
+    if args.attach:
+        proc, client, log = attach(project)
+        log_path = args.editor_log or ""
+    elif args.windowed:  # launch() is always headless
         real = run_e2e.subprocess.Popen
         run_e2e.subprocess.Popen = lambda cmd, **kw: real([c for c in cmd if c != "--headless"], **kw)
         try:
@@ -185,11 +237,8 @@ def main() -> int:
                     for f in files[n][1:]:
                         png_noise(os.path.join(packages[n], f), args.tex_size)
             # Two agents send the same package into the same folder; two others send their own.
-            calls = [("import_package", {"source_dir": packages["RubbleOperator"], "folder": "RubbleOperator"}),
-                     ("import_package", {"source_dir": packages["RubbleOperator"], "folder": "RubbleOperator"}),
-                     ("import_package", {"source_dir": packages["Crate"], "folder": "Crate"}),
-                     ("import_package", {"source_dir": packages["Barrel"], "folder": "Barrel"}),
-                     ("import_package", {"source_dir": packages["Hero"], "folder": "Hero"})]
+            calls = [("import_package", {"source_dir": packages[n], "folder": n})
+                     for n in (names[0], names[0], names[1], names[2], hero_name)]
             seen_queue: list = []
             stop = threading.Event()
 
@@ -253,13 +302,14 @@ def main() -> int:
             bad = [line["text"] for line in lines if any(b in line["text"] for b in BAD_LOG_LINES)]
             check(not bad, "no corrupt reads or recursive reimports in the editor log", bad[:4])
     finally:
-        proc.terminate()
-        try:
-            proc.wait(10)
-        except Exception:
-            proc.kill()
+        if not args.attach:
+            proc.terminate()
+            try:
+                proc.wait(10)
+            except Exception:
+                proc.kill()
         log.close()
-        text = open(log_path, errors="replace").read()
+        text = open(log_path, errors="replace").read() if log_path and os.path.isfile(log_path) else ""
         if ENGINE_NOISE in text:
             print(f"  note: the editor logged \"{ENGINE_NOISE}\" {text.count(ENGINE_NOISE)} time(s) (Godot's own; see ENGINE_NOISE)")
         bad = [b for b in BAD_LOG_LINES if b in text]
