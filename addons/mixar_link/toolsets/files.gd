@@ -115,9 +115,9 @@ func _move_file(args: Dictionary):
 		if DirAccess.rename_absolute(ProjectSettings.globalize_path(from + suffix), ProjectSettings.globalize_path(to + suffix)) != OK:
 			return err("Could not move %s to %s." % [from + suffix, to + suffix], {"moved": moved})
 		moved.append(to + suffix)
-	# An .import sidecar names its source file; the scan re-imports at the new path.
-	var fs := EditorInterface.get_resource_filesystem()
-	fs.scan()
+	# An .import sidecar names its source file; the scan re-imports at the new path
+	# (once the editor is idle: never inside a running import).
+	t.request_scan()
 	return ok({"from": from, "to": to, "moved": moved,
 		"note": "Files that reference the old path (not by uid) still name it; read_file and fix them if needed."})
 
@@ -142,8 +142,10 @@ func _rescan():
 	var fs := EditorInterface.get_resource_filesystem()
 	var tree: SceneTree = t.plugin.get_tree()
 	var t0 := Time.get_ticks_msec()
-	fs.scan()
+	# Never start a scan inside a running scan or import (a package import's).
+	if await t.wait_fs_idle(t0 + 60000):
+		fs.scan()
 	await tree.process_frame
-	while fs.is_scanning() and Time.get_ticks_msec() - t0 < 60000:
+	while (fs.is_scanning() or fs.is_importing()) and Time.get_ticks_msec() - t0 < 60000:
 		await tree.process_frame
 	return ok({"scanning": fs.is_scanning(), "seconds": snappedf((Time.get_ticks_msec() - t0) / 1000.0, 0.1)})

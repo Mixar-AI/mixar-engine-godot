@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -23,6 +24,9 @@ import tempfile
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import run_e2e as e2e  # noqa: E402
 from run_e2e import check  # noqa: E402
+
+VERSION = re.search(r'^version="(.*)"$', open(os.path.join(e2e.ROOT, "addons", "mixar_link", "plugin.cfg")).read(),
+                    re.M).group(1)
 
 TOOLSETS = ["godot.classes", "godot.scene", "godot.resources", "godot.files", "godot.editor"]
 PROP_SCENE = ('[gd_scene format=3]\n\n[node name="Prop" type="Node3D"]\n\n'
@@ -82,7 +86,7 @@ def discovery_checks(c: e2e.Client, ts: Toolsets) -> None:
     check({"list_toolsets", "describe_toolset", "call_tool"} <= names, "tools/list has the three toolset tools")
     check({"status", "place", "set_property", "write_file", "build_info"} <= names, "the existing top-level tools stay")
     st = c.call("status")["structuredContent"]
-    check(st.get("toolsets") is True and st.get("adapter_version") == "0.5.0", "status says toolsets: true, 0.5.0", st)
+    check(st.get("toolsets") is True and st.get("adapter_version") == VERSION, f"status says toolsets: true, {VERSION}", st)
     r = c.call("list_toolsets")
     sets = json.loads(r["content"][0]["text"])["toolsets"]
     check(not r["isError"] and [s["name"] for s in sets] == TOOLSETS and all(s["tools"] > 0 for s in sets),
@@ -90,7 +94,7 @@ def discovery_checks(c: e2e.Client, ts: Toolsets) -> None:
     for s in sets:
         r = c.call("describe_toolset", {"toolset_name": s["name"]})
         d = json.loads(r["content"][0]["text"])
-        ok = (d["name"] == s["name"] and d["version"] == "0.5.0" and len(d["tools"]) == s["tools"]
+        ok = (d["name"] == s["name"] and d["version"] == VERSION and len(d["tools"]) == s["tools"]
               and all(t["description"] and t["inputSchema"]["type"] == "object" and "." not in t["name"]
                       for t in d["tools"]))
         check(ok, f"describe_toolset {s['name']} ({len(d['tools'])} tools, short names, schemas)")
@@ -345,7 +349,7 @@ def editor_checks(ts: Toolsets, c: e2e.Client) -> None:
     check(d.get("selected") == ["Lamp", "Group/Box"], "select", d)
     d = ts.data("godot.editor", "editor_state")
     check(d.get("edited_scene") == "res://mixar/levels/Tools.tscn" and d.get("scene_editable") is True
-          and set(d.get("selection", [])) == {"Lamp", "Group/Box"} and d.get("adapter_version") == "0.5.0",
+          and set(d.get("selection", [])) == {"Lamp", "Group/Box"} and d.get("adapter_version") == VERSION,
           "editor_state", d)
     for view in ("3d", "2d"):
         r = ts.call("godot.editor", "capture_editor", {"view": view, "max_width": 320})

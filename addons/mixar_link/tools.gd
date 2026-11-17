@@ -8,7 +8,7 @@ extends RefCounted
 ## Mixar works in: Blender (x, y, z) is Godot (x, z, -y), and a yaw about
 ## Blender's Z is the same angle about Godot's Y.
 
-const ADAPTER_VERSION := "0.5.0"
+const ADAPTER_VERSION := "0.5.1"
 ## Project settings the STUDIO sets (never the agent): "owned" (default, a
 ## Mixar-made game) or "plugin" (an existing project: Mixar keeps to
 ## res://mixar/, never edits project settings, and edits only levels under
@@ -19,6 +19,11 @@ const MIXAR_DIR := "res://mixar"
 const Retarget := preload("res://addons/mixar_link/retarget.gd")
 const Toolsets := preload("res://addons/mixar_link/toolsets/registry.gd")
 const IMPORT_TIMEOUT_MS := 120000
+## Idle frames an indexed package may stay unimported before the import counts as failed.
+const IMPORT_SETTLE_FRAMES := 30
+const MAX_IMPORT_SCANS := 5
+## How many finished imports status lists.
+const RECENT_IMPORTS := 8
 const PLAY_TIMEOUT_MS := 20000
 const FRAME_TIMEOUT_MS := 8000
 const LOADING_FRAME_TIMEOUT_MS := 12000
@@ -43,6 +48,13 @@ var debugger: EditorDebuggerPlugin
 var log_buffer: Logger
 ## The editor toolsets (godot.classes, .scene, .resources, .files, .editor).
 var toolsets: RefCounted
+## The package import queue (see _import_package): waiting tickets in order,
+## the running one ({} when none), the last few results.
+var _import_queue: Array = []
+var _import_running: Dictionary = {}
+var _import_seq := 0
+var _recent_imports: Array = []
+var _scan_pending := false
 
 
 func _init(p_plugin: EditorPlugin, p_debugger: EditorDebuggerPlugin, p_log: Logger) -> void:
@@ -176,9 +188,28 @@ func _status() -> Dictionary:
 		"log_seq": log_buffer.latest(),
 		"project_mode": _mode(),
 		"toolsets": true,
+		"imports": _imports_status(),
 	})
 
 
+## Package imports run one at a time, in the order they arrive. Mixar's agents
+## may send several packages at once (even the same one into the same folder),
+## and the editor cannot take that: a second import used to copy files the
+## first was still importing (a corrupt read) or call reimport_files() inside a
+## running import, which crashes the editor. So each import:
+##   1. is checked, then queued (FIFO; status shows the queue);
+##   2. copies the package into a staging folder in the project data folder
+##      (.godot/, which the editor never scans), on the same disk;
+##   3. waits for its turn and for the editor to be neither scanning nor
+##      importing, then, in that same frame, renames every file into
+##      res://mixar/<folder>/ (atomic: the importer never sees a half-written
+##      file), textures first and the main file last;
+##   4. scans once (scanning again if a scan already running dropped it). The
+##      scan's single reimport_files() imports the package in importer order:
+##      textures before the scene that uses them;
+##   5. answers only when the main file and every texture are imported.
+## reimport_files() (a rig's retarget) runs only when the editor is idle, a
+## frame after the scan, never from inside a filesystem signal.
 func _import_package(args: Dictionary):
 	var src := String(args.get("source_dir", ""))
 	var folder := String(args.get("folder", ""))
@@ -193,47 +224,174 @@ func _import_package(args: Dictionary):
 	var main := _main_file(manifest)
 	if main == "":
 		return _err("The manifest names no glb, gltf or fbx file.")
-	var dest_res := MIXAR_DIR.path_join(folder)
-	var dest := ProjectSettings.globalize_path(dest_res)
-	DirAccess.make_dir_recursive_absolute(dest)
-	var copied := _copy_tree(src, dest)
-	if copied < 0:
-		return _err("Copying the package into the project failed.")
+	_import_seq += 1
+	var ticket := {"id": _import_seq, "folder": folder, "queued_ms": Time.get_ticks_msec(),
+		"ahead": _import_queue.size() + (0 if _import_running.is_empty() else 1)}
+	_import_queue.append(ticket)
+	var tree := plugin.get_tree()
+	while not _import_running.is_empty() or _import_queue[0].id != ticket.id:
+		_reap_stale_import()
+		await tree.process_frame
+	_import_queue.pop_front()
+	ticket["started_ms"] = Time.get_ticks_msec()
+	_import_running = ticket
+	# The inner function returns on every path, so the queue is always released.
+	var data: Dictionary = await _run_import(ticket, src, folder, main, manifest)
+	ticket["finished_ms"] = Time.get_ticks_msec()
+	if _import_running.get("id") == ticket.id:
+		_import_running = {}
+	data["import_id"] = ticket.id
+	data["jobs_ahead"] = ticket.ahead
+	data["queued_seconds"] = snappedf((ticket.started_ms - ticket.queued_ms) / 1000.0, 0.1)
+	data["started_ms"] = ticket.started_ms
+	data["finished_ms"] = ticket.finished_ms
+	_recent_imports.append({"id": ticket.id, "folder": folder, "imported": not data.has("error"),
+		"error": String(data.get("error", "")), "finished_ms": ticket.finished_ms})
+	if _recent_imports.size() > RECENT_IMPORTS:
+		_recent_imports.pop_front()
+	if data.has("error"):
+		var message: String = data.error
+		data.erase("error")
+		return _err(message, data)
+	return _ok(data)
+
+
+## One import, run while it holds the queue; the result data, with "error" on a failure.
+func _run_import(ticket: Dictionary, src: String, folder: String, main: String, manifest: Dictionary) -> Dictionary:
 	var fs := EditorInterface.get_resource_filesystem()
 	var tree := plugin.get_tree()
-	var t0 := Time.get_ticks_msec()
-	fs.scan()
-	await tree.process_frame
+	var t0: int = ticket.started_ms
+	var deadline := t0 + IMPORT_TIMEOUT_MS
+	var dest_res := MIXAR_DIR.path_join(folder)
 	var main_res := dest_res.path_join(main)
-	while Time.get_ticks_msec() - t0 < IMPORT_TIMEOUT_MS:
-		if not fs.is_scanning() and ResourceLoader.exists(main_res):
-			break
-		await tree.process_frame
-	var imported := ResourceLoader.exists(main_res)
-	var retarget := {}
-	if imported:
-		# A Tripo or Mixamo rig goes onto Godot's humanoid profile, so clips
-		# made on any mapped character play on this one (retarget.gd).
-		retarget = Retarget.configure(main_res)
-		if not retarget.is_empty():
-			fs.reimport_files(PackedStringArray([main_res]))  # blocks until reimported
-			await tree.process_frame
 	var engine: Dictionary = manifest.engine if typeof(manifest.get("engine")) == TYPE_DICTIONARY else {}
 	var data := {
-		"folder": dest_res, "main_scene": main_res if imported else "", "imported": imported,
-		"files_copied": copied, "seconds": snappedf((Time.get_ticks_msec() - t0) / 1000.0, 0.1),
+		"folder": dest_res, "main_scene": "", "imported": false, "files_copied": 0, "seconds": 0.0,
 		"engine_target": String(engine.get("target", "")),
 		"tagged_objects": (engine.get("objects", []) as Array).size(),
 		"collision_nodes": int(engine.get("collision_nodes", 0)),
 	}
-	if not retarget.is_empty():
-		data["retarget"] = {"naming": retarget.naming, "profile": "humanoid", "mapped_bones": retarget.mapped,
-			"skeleton": "%GeneralSkeleton", "note": "Bones take Godot's humanoid names (Hips, LeftUpperArm, ...); "
-			+ "a clip from any retargeted character plays on this one."}
+	# Only the running import stages, so anything there is left over (a crash).
+	_remove_tree(_staging_root())
+	var stage := _staging_root().path_join(str(ticket.id))
+	var files := _stage_tree(src, stage, "")
+	if files.is_empty() or not files.has(main):
+		_remove_tree(stage)
+		data["error"] = "Copying the package into the project failed."
+		return data
+	# Textures (and everything else) first, the main file last.
+	files.erase(main)
+	files.append(main)
+	if not await wait_fs_idle(deadline):
+		_remove_tree(stage)
+		data["error"] = "The editor was still scanning or importing after %d s; nothing was changed. Try again." % (
+			IMPORT_TIMEOUT_MS / 1000)
+		return data
+	# The editor is idle in this frame: move the whole package into place now.
+	var moved := _move_staged(stage, ProjectSettings.globalize_path(dest_res), files)
+	_remove_tree(stage)
+	if moved < 0:
+		data["error"] = "Moving the package into %s failed." % dest_res
+		return data
+	data["files_copied"] = moved
+	var wanted := _import_wanted(files, main)
+	var scans := 0
+	var idle_frames := 0
+	while Time.get_ticks_msec() < deadline:
+		if fs.is_scanning() or fs.is_importing():
+			idle_frames = 0
+		else:
+			# Checked only after our own scan: the index may still call the
+			# files that were just replaced valid.
+			var state := _import_state(dest_res, wanted)
+			if scans > 0 and state == "imported":
+				break
+			if scans == 0 or (state == "unindexed" and scans < MAX_IMPORT_SCANS):
+				# Ours, or again when a scan that was already running dropped ours.
+				fs.scan()
+				scans += 1
+				idle_frames = 0
+			else:
+				idle_frames += 1
+				if idle_frames > IMPORT_SETTLE_FRAMES:
+					break  # indexed, idle, still not valid: the importer failed
+		await tree.process_frame
+	var imported := _import_state(dest_res, wanted) == "imported" and ResourceLoader.exists(main_res)
+	data["imported"] = imported
+	data["main_scene"] = main_res if imported else ""
+	if imported:
+		# A Tripo or Mixamo rig goes onto Godot's humanoid profile, so clips
+		# made on any mapped character play on this one (retarget.gd).
+		var retarget := Retarget.configure(main_res)
+		if not retarget.is_empty():
+			await tree.process_frame  # never inside the scan's own signals
+			if await wait_fs_idle(Time.get_ticks_msec() + IMPORT_TIMEOUT_MS):
+				fs.reimport_files(PackedStringArray([main_res]))  # blocks until reimported
+			else:
+				retarget = {}
+			await tree.process_frame
+		if not retarget.is_empty():
+			data["retarget"] = {"naming": retarget.naming, "profile": "humanoid", "mapped_bones": retarget.mapped,
+				"skeleton": "%GeneralSkeleton", "note": "Bones take Godot's humanoid names (Hips, LeftUpperArm, ...); "
+				+ "a clip from any retargeted character plays on this one."}
+	data["seconds"] = snappedf((Time.get_ticks_msec() - t0) / 1000.0, 0.1)
 	if not imported:
-		return _err("The package was copied but %s did not import within %d s; read log for the importer's errors." % [
-			main_res, IMPORT_TIMEOUT_MS / 1000], data)
-	return _ok(data)
+		data["error"] = "The package was copied but %s did not import within %d s; read log for the importer's errors." % [
+			main_res, IMPORT_TIMEOUT_MS / 1000]
+	return data
+
+
+## Waits a frame at a time until the editor is neither scanning nor importing:
+## true then (the caller may scan or reimport in this same frame), false at
+## `deadline_ms`. Every scan or reimport the link starts goes through this, so
+## none starts inside a running import (reimport_files() is not reentrant, and
+## its progress dialog runs frames while it imports).
+func wait_fs_idle(deadline_ms: int) -> bool:
+	var fs := EditorInterface.get_resource_filesystem()
+	var tree := plugin.get_tree()
+	while fs.is_scanning() or fs.is_importing():
+		if Time.get_ticks_msec() > deadline_ms:
+			return false
+		await tree.process_frame
+	return true
+
+
+## A scan now if the editor is idle, else as soon as it is (never inside a
+## running import). For tools that change files and do not wait for the scan.
+func request_scan() -> void:
+	var fs := EditorInterface.get_resource_filesystem()
+	if not fs.is_scanning() and not fs.is_importing():
+		fs.scan()
+		return
+	if _scan_pending:
+		return
+	_scan_pending = true
+	await wait_fs_idle(Time.get_ticks_msec() + IMPORT_TIMEOUT_MS)
+	_scan_pending = false
+	if not fs.is_scanning() and not fs.is_importing():
+		fs.scan()
+
+
+## The import queue for status: the running import, the queued ones, the last few results.
+func _imports_status() -> Dictionary:
+	var now := Time.get_ticks_msec()
+	var queued: Array = []
+	for t in _import_queue:
+		queued.append({"id": t.id, "folder": t.folder, "waiting_seconds": snappedf((now - t.queued_ms) / 1000.0, 0.1)})
+	var running = null
+	if not _import_running.is_empty():
+		running = {"id": _import_running.id, "folder": _import_running.folder,
+			"seconds": snappedf((now - _import_running.started_ms) / 1000.0, 0.1)}
+	return {"running": running, "queued": queued, "recent": _recent_imports.duplicate()}
+
+
+## Frees the queue if its running import has been stuck far past its timeout
+## (its coroutine died with a script error), so later imports still run.
+func _reap_stale_import() -> void:
+	if not _import_running.is_empty() and Time.get_ticks_msec() - int(_import_running.started_ms) > 3 * IMPORT_TIMEOUT_MS:
+		push_warning("Mixar Link: import %d (%s) never finished; running the next one." % [
+			_import_running.id, _import_running.folder])
+		_import_running = {}
 
 
 func _new_scene(args: Dictionary):
@@ -662,7 +820,7 @@ func _delete_file(args: Dictionary):
 		return _err("No such file: " + path)
 	if DirAccess.remove_absolute(ProjectSettings.globalize_path(path)) != OK:
 		return _err("Could not delete " + path)
-	EditorInterface.get_resource_filesystem().scan()
+	request_scan()
 	return _ok({"deleted": path})
 
 
@@ -1049,23 +1207,83 @@ static func _main_file(manifest: Dictionary) -> String:
 	return ""
 
 
-## Copies every file under `src` into `dest` (Blender sources skipped);
-## the number copied, or -1 on a failure.
-static func _copy_tree(src: String, dest: String) -> int:
+## The staging folder for package imports, inside the project data folder
+## (.godot/), which the editor never scans, on the same disk as res://.
+static func _staging_root() -> String:
+	var data_dir := EditorInterface.get_editor_paths().get_project_settings_dir().get_base_dir()
+	return ProjectSettings.globalize_path(data_dir).path_join("mixar_link").path_join("staging")
+
+
+## Copies every file under `src` into `dest` (Blender sources and hidden files
+## skipped); their paths relative to the package, or [] on a failure.
+static func _stage_tree(src: String, dest: String, rel: String) -> Array:
 	var dir := DirAccess.open(src)
-	if dir == null:
-		return -1
-	var count := 0
-	DirAccess.make_dir_recursive_absolute(dest)
+	if dir == null or DirAccess.make_dir_recursive_absolute(dest) != OK:
+		return []
+	var out: Array = []
 	for sub in dir.get_directories():
-		var n := _copy_tree(src.path_join(sub), dest.path_join(sub))
-		if n < 0:
-			return -1
-		count += n
+		if sub.begins_with("."):
+			continue
+		var inner := _stage_tree(src.path_join(sub), dest.path_join(sub), rel.path_join(sub))
+		if inner.is_empty() and not DirAccess.get_files_at(src.path_join(sub)).is_empty():
+			return []
+		out.append_array(inner)
 	for file in dir.get_files():
-		if file.get_extension().to_lower() in SKIP_EXTENSIONS:
+		if file.begins_with(".") or file.get_extension().to_lower() in SKIP_EXTENSIONS:
 			continue
 		if DirAccess.copy_absolute(src.path_join(file), dest.path_join(file)) != OK:
-			return -1
-		count += 1
-	return count
+			return []
+		out.append(rel.path_join(file))
+	return out
+
+
+## Renames the staged `files` (relative paths, in order) into `dest`, replacing
+## what is there; the number moved, or -1 on a failure.
+static func _move_staged(stage: String, dest: String, files: Array) -> int:
+	for rel in files:
+		var to := dest.path_join(rel)
+		DirAccess.make_dir_recursive_absolute(to.get_base_dir())
+		if DirAccess.rename_absolute(stage.path_join(rel), to) != OK:
+			# Some platforms do not rename over an existing file.
+			DirAccess.remove_absolute(to)
+			if DirAccess.rename_absolute(stage.path_join(rel), to) != OK:
+				return -1
+	return files.size()
+
+
+## Deletes a folder and everything in it (absolute path); missing is fine.
+static func _remove_tree(path: String) -> void:
+	if not DirAccess.dir_exists_absolute(path):
+		return
+	for sub in DirAccess.get_directories_at(path):
+		_remove_tree(path.path_join(sub))
+	for file in DirAccess.get_files_at(path):
+		DirAccess.remove_absolute(path.path_join(file))
+	DirAccess.remove_absolute(path)
+
+
+## The package files the answer waits for: the main file and every texture.
+static func _import_wanted(files: Array, main: String) -> Array:
+	var textures := ResourceLoader.get_recognized_extensions_for_type("Texture2D")
+	var out: Array = []
+	for rel in files:
+		if rel == main or String(rel).get_extension().to_lower() in textures:
+			out.append(rel)
+	return out
+
+
+## "imported" when every wanted file of res://mixar/<folder>/ is in the
+## editor's index with a valid import, "unindexed" when one is not in the
+## index yet (a scan has not seen it), else "pending".
+static func _import_state(dest_res: String, wanted: Array) -> String:
+	var fs := EditorInterface.get_resource_filesystem()
+	var state := "imported"
+	for rel in wanted:
+		var path := dest_res.path_join(rel)
+		var dir := fs.get_filesystem_path(path.get_base_dir())
+		var idx := dir.find_file_index(path.get_file()) if dir != null else -1
+		if idx < 0:
+			return "unindexed"
+		if not dir.get_file_import_is_valid(idx) or not FileAccess.file_exists(path + ".import"):
+			state = "pending"
+	return state
