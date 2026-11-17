@@ -73,7 +73,7 @@ func _create(args: Dictionary):
 	res.take_over_path(path)
 	var fs := EditorInterface.get_resource_filesystem()
 	if new_dir:
-		fs.scan()  # update_file does not add a new folder to the index
+		t.request_scan()  # update_file does not add a new folder to the index
 	else:
 		fs.update_file(path)
 	return ok({"path": path, "type": type, "properties": Values.changed_properties(res)})
@@ -166,10 +166,10 @@ func _list(args: Dictionary):
 		# A folder made moments ago: wait for the index to catch up.
 		var tree: SceneTree = t.plugin.get_tree()
 		var t0 := Time.get_ticks_msec()
-		if not fs.is_scanning():
+		if await t.wait_fs_idle(t0 + 30000):
 			fs.scan()
 		await tree.process_frame
-		while fs.is_scanning() and Time.get_ticks_msec() - t0 < 30000:
+		while t.fs_busy() and Time.get_ticks_msec() - t0 < 30000:
 			await tree.process_frame
 		start = fs.get_filesystem_path(dir)
 	if start == null:

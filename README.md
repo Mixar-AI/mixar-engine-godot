@@ -35,8 +35,8 @@ after `initialize`).
 
 | Tool | Does |
 | --- | --- |
-| `status` | Engine, project, open scene, main scene, whether the game runs |
-| `import_package` | Copies a Mixar package folder into `res://mixar/<folder>/` (skipping `.blend` sources) and waits for the import |
+| `status` | Engine, project, open scene, main scene, whether the game runs, and the package import queue (`imports`: `running`, `queued`, `recent`) |
+| `import_package` | Copies a Mixar package folder into `res://mixar/<folder>/` (skipping `.blend` sources) and answers once it is imported. Imports run one at a time, in order (see below) |
 | `new_scene` | Creates `res://mixar/levels/<name>.tscn` (sun, sky, camera by default), opens it, optionally sets it as the main scene |
 | `open_scene` | Opens a scene |
 | `place` | Instances an imported scene at a position and yaw, with undo, then saves |
@@ -55,6 +55,31 @@ after `initialize`).
 | `project_setting` | Reads any setting; in owned projects sets input actions (`{keys, mouse}`), autoloads, the main scene, window, physics, environment defaults and layer names |
 | `build_info` | The last web build's files and folder, for the Mixar desktop to upload a share |
 | `list_toolsets` / `describe_toolset` / `call_tool` | The editor toolsets below (same shape as Epic's Unreal server): list them, get one's tools with JSON input schemas, run one |
+
+## Package imports
+
+Mixar runs several agents at once, and they can send packages at the same moment
+(even the same package into the same folder). The editor imports them one at a
+time, in the order they arrive:
+
+1. The call is checked (folder name, manifest), then queued.
+2. The package is copied into `.godot/mixar_link/staging/`, which the editor never scans.
+3. When its turn comes and the editor has been idle for a few frames (not scanning, not
+   importing, and not in the frames `reimport_files()` runs after it clears
+   `is_importing()`), every file
+   is renamed into `res://mixar/<folder>/` in one frame, textures first and the main
+   file last, so the importer never reads a half-written file.
+4. One scan imports the package. Its single `reimport_files()` runs in importer order,
+   so textures are imported before the scene that uses them. If the editor's own
+   reimport skipped files, the link reimports what is left in one `reimport_files()`
+   call, while the editor is idle.
+5. The call answers when the main file and every texture are imported. A rig's
+   retarget reimport runs only while the editor is idle.
+
+The answer carries `import_id`, `jobs_ahead`, `queued_seconds`, `started_ms` and
+`finished_ms`. The 120 s import timeout counts from when the import starts, not
+from when it was queued. A caller that stops waiting can still follow its import
+in `status.imports`.
 
 ## Editor toolsets
 
@@ -150,6 +175,9 @@ extras. Godot reads the extras as node metadata.
 python3 test/run_e2e.py --godot /path/to/Godot            # headless editor and game (108 checks: plays levels to a win, scripted gameplay, plugin mode)
 python3 test/run_toolsets_e2e.py --godot /path/to/Godot   # every editor toolset tool, undo, refusals and plugin mode (117 checks)
 python3 test/run_e2e.py --godot /path/to/Godot --windowed-game   # also checks a real frame
+python3 test/run_concurrent_import_e2e.py --godot /path/to/Godot   # simultaneous imports (same folder twice, a rig): no overlap, no corrupt read, no crash
+python3 test/run_concurrent_import_e2e.py --godot /path/to/Godot --windowed --tex-size 4096   # the same with an editor window (its progress dialog runs frames mid-import, the crash's path)
+python3 test/run_concurrent_import_e2e.py --attach ~/Games/my-game --editor-log /var/log/mixar-cloud/godot.log   # against an editor already running (a cloud workstation); imports go to res://mixar/zzLinkTest*
 ```
 
 ## License
