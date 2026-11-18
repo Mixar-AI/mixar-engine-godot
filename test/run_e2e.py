@@ -255,8 +255,11 @@ STRIP = [
     {"name": "Coin", "t": [6, 0.8, 0], "s": [0.4, 0.4, 0.4], "extras": {"mixar_role": "pickup"}},
     {"name": "Block", "t": [10, 0.4, 0], "s": [1, 0.8, 4], "extras": {"mixar_body": "static"},
      "children": ["Block_col-convcolonly"]},
-    {"name": "Flag", "t": [16, 1, 0], "s": [1, 2, 2], "extras": {"mixar_role": "goal"}},
 ]
+# The strip's goal is an empty in Mixar: the export drops it from the file and lists
+# it in the manifest (engine.markers); place adds it as a tagged Marker3D. Blender
+# frame: glTF (16, 1, 0) is Blender (16, 0, 1).
+STRIP_MARKERS = [{"name": "Flag", "role": "goal", "position": [16, 0, 1], "yaw_deg": 0}]
 
 
 class Client:
@@ -795,12 +798,17 @@ def main() -> int:
         os.makedirs(strip_pkg)
         glb_level(os.path.join(strip_pkg, "Strip.glb"), STRIP)
         with open(os.path.join(strip_pkg, "manifest.json"), "w") as fh:
-            json.dump({"asset": "Strip", "files": [{"file": "Strip.glb"}], "engine": {"target": "godot"}}, fh)
+            json.dump({"asset": "Strip", "files": [{"file": "Strip.glb"}],
+                       "engine": {"target": "godot", "markers": STRIP_MARKERS}}, fh)
         r = client.call("new_scene", {"name": "StripLevel", "set_main": True, "template": "platformer"})
         check(not r["isError"], "new_scene platformer", r)
         client.call("import_package", {"source_dir": strip_pkg, "folder": "Strip"})
-        client.call("place", {"scene": "res://mixar/Strip/Strip.glb", "name": "Strip"})
+        r = client.call("place", {"scene": "res://mixar/Strip/Strip.glb", "name": "Strip"})
+        check(not r["isError"] and r["structuredContent"].get("markers") == ["Flag"],
+              "place adds the manifest's markers", r)
         level = open(os.path.join(project, "mixar", "levels", "StripLevel.tscn")).read()
+        check('[node name="Flag" type="Marker3D" parent="Strip"' in level and '"mixar_goal"' in level,
+              "a marker is saved in the level, in its role's group", level[-1500:])
         check('mode = "platformer"' in level, "the platformer player is saved in its mode")
         client.call("play", {"scene": "main"}, timeout=60)
         r = client.call("playtest", {"steps": [
