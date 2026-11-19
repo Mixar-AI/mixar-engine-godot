@@ -8,7 +8,7 @@ extends RefCounted
 ## Mixar works in: Blender (x, y, z) is Godot (x, z, -y), and a yaw about
 ## Blender's Z is the same angle about Godot's Y.
 
-const ADAPTER_VERSION := "0.5.2"
+const ADAPTER_VERSION := "0.5.3"
 ## Project settings the STUDIO sets (never the agent): "owned" (default, a
 ## Mixar-made game) or "plugin" (an existing project: Mixar keeps to
 ## res://mixar/, never edits project settings, and edits only levels under
@@ -66,6 +66,7 @@ var _scan_pending := false
 ## ("Task 'reimport' already exists") and can crash the editor.
 var _reimport_started_ms := 0
 var _reimport_end_frame := -1
+var _progress_dialogs: Array[Node] = []
 
 
 func _init(p_plugin: EditorPlugin, p_debugger: EditorDebuggerPlugin, p_log: Logger) -> void:
@@ -73,6 +74,7 @@ func _init(p_plugin: EditorPlugin, p_debugger: EditorDebuggerPlugin, p_log: Logg
 	debugger = p_debugger
 	log_buffer = p_log
 	toolsets = Toolsets.new(self)
+	_progress_dialogs = plugin.get_tree().root.find_children("*", "ProgressDialog", true, false)
 	var fs := EditorInterface.get_resource_filesystem()
 	fs.resources_reimporting.connect(_on_reimporting)
 	fs.resources_reimported.connect(_on_reimported)
@@ -105,6 +107,13 @@ func fs_busy() -> bool:
 	var fs := EditorInterface.get_resource_filesystem()
 	if fs.is_scanning() or fs.is_importing():
 		return true
+	# Godot's progress dialog runs nested process frames while registering
+	# script classes, when both filesystem flags can be false. Reimporting
+	# from one of those frames recursively clears the script-class worklist
+	# and crashes the editor. Wait for the native progress task to unwind.
+	for dialog in _progress_dialogs:
+		if is_instance_valid(dialog) and dialog is CanvasItem and dialog.is_visible_in_tree():
+			return true
 	# A reimport that never reported its end (an importer error) stops counting after 10 min.
 	if _reimport_started_ms != 0 and Time.get_ticks_msec() - _reimport_started_ms < 600000:
 		return true
