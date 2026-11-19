@@ -177,6 +177,7 @@ python3 test/run_toolsets_e2e.py --godot /path/to/Godot   # every editor toolset
 python3 test/run_e2e.py --godot /path/to/Godot --windowed-game   # also checks a real frame
 python3 test/run_concurrent_import_e2e.py --godot /path/to/Godot   # simultaneous imports (same folder twice, a rig): no overlap, no corrupt read, no crash
 python3 test/run_concurrent_import_e2e.py --godot /path/to/Godot --windowed --tex-size 4096   # the same with an editor window (its progress dialog runs frames mid-import, the crash's path)
+python3 test/run_concurrent_import_e2e.py --godot /path/to/Godot --windowed --mixed-writes --scripts 300   # imports during script-class registration (reproduces the 4.7.2 nested-progress crash without the guard)
 python3 test/run_concurrent_import_e2e.py --attach ~/Games/my-game --editor-log /var/log/mixar-cloud/godot.log   # against an editor already running (a cloud workstation); imports go to res://mixar/zzLinkTest*
 ```
 

@@ -27,17 +27,23 @@ func _post_process(scene: Node) -> void:
 				tags[String(key)] = String(extras[key])
 		if tags.is_empty():
 			continue
-		for key in tags:
-			node.set_meta(key, tags[key])
-		node.add_to_group("mixar_tagged", true)
-		var role := String(tags.get("mixar_role", ""))
-		if role != "":
-			node.add_to_group("mixar_" + role, true)
-		if role == "player":
-			node.add_to_group("mixar_player_model", true)
-		if tags.has("mixar_nav"):
-			node.add_to_group("mixar_nav_" + tags.mixar_nav, true)
-		if tags.has("mixar_body"):
-			node.add_to_group("mixar_body_" + tags.mixar_body, true)
-		if ROLE_SCRIPTS.has(role) and node is Node3D:
-			node.set_script(load(DIR + ROLE_SCRIPTS[role]))
+		apply_tags(node, tags)
+
+
+## A node's mixar_* tags as metadata, persistent groups and its role's
+## component script. Also used by place for a package's markers.
+static func apply_tags(node: Node, tags: Dictionary) -> void:
+	for key in tags:
+		node.set_meta(key, tags[key])
+	node.add_to_group("mixar_tagged", true)
+	var role := String(tags.get("mixar_role", ""))
+	if role != "":
+		node.add_to_group("mixar_" + role, true)
+	if role == "player":
+		node.add_to_group("mixar_player_model", true)
+	if tags.has("mixar_nav"):
+		node.add_to_group("mixar_nav_" + tags.mixar_nav, true)
+	if tags.has("mixar_body"):
+		node.add_to_group("mixar_body_" + tags.mixar_body, true)
+	if ROLE_SCRIPTS.has(role) and node is Node3D:
+		node.set_script(load(DIR + ROLE_SCRIPTS[role]))

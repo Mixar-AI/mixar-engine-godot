@@ -37,7 +37,7 @@ from run_e2e import check, launch, FAILURES  # noqa: E402
 
 ROOT = run_e2e.ROOT
 BAD_LOG_LINES = ("reimport_files() recursively", "ERR_FILE_CORRUPT", "Error loading image",
-                 "Program crashed", "handle_crash")
+                 "Program crashed", "handle_crash", "Task 'update_scripts_classes' already exists")
 # Godot 4.7's own, with a window, on any first import of a GLB that uses textures, one at
 # a time too: the scene import flags its textures as used in 3D, and the editor reimports
 # them (ResourceImporterTexture::update_imports) in a frame reimport_files() runs after it
@@ -187,6 +187,8 @@ def main() -> int:
     ap.add_argument("--tex-size", type=int, default=2048, help="texture edge in pixels (2048 = a 12 MB PNG)")
     ap.add_argument("--keep", action="store_true")
     ap.add_argument("--serial", action="store_true", help="one import at a time (a baseline for the log checks)")
+    ap.add_argument("--mixed-writes", action="store_true", help="write and rescan scripts while packages import")
+    ap.add_argument("--scripts", type=int, default=0, help="script classes per package to stress editor indexing")
     ap.add_argument("--windowed", action="store_true",
                     help="run the editor with a window (its progress dialog runs frames during an import)")
     args = ap.parse_args()
@@ -207,6 +209,10 @@ def main() -> int:
     p = "zzLinkTest" if args.attach else ""  # never a real asset's folder in someone's project
     names = [p + "RubbleOperator", p + "Crate", p + "Barrel"]
     packages = {n: make_package(exports, n, args.tex_size) for n in names}
+    for n, folder in packages.items():
+        for i in range(args.scripts):
+            with open(os.path.join(folder, f"stress_{i}.gd"), "w") as fh:
+                fh.write(f"class_name {n}ImportStress{i}\nextends Node\n")
     files = {n: [n + ".glb", f"textures/{n}_Body_basecolor.001.png", f"textures/{n}_Body_normal.001.png"]
              for n in names}
     # A Tripo rig: its import retargets, which reimports the GLB (the reimport_files() call).
@@ -254,6 +260,27 @@ def main() -> int:
 
             watcher = threading.Thread(target=watch)
             watcher.start()
+            write_results = []
+
+            def write_scripts():
+                for i in range(12):
+                    if stop.is_set():
+                        break
+                    try:
+                        write_results.append(client.call("write_file", {
+                            "path": f"res://mixar/scripts/stress_{rnd}_{i}.gd",
+                            "content": f"class_name ImportStress{rnd}_{i}\nextends Node\n",
+                        }, timeout=60))
+                        write_results.append(client.call("call_tool", {
+                            "toolset_name": "godot.files", "tool_name": "rescan", "arguments": {},
+                        }, timeout=60))
+                    except Exception as exc:
+                        write_results.append({"isError": True, "error": str(exc)})
+                        break
+
+            writer = threading.Thread(target=write_scripts) if args.mixed_writes else None
+            if writer:
+                writer.start()
             t0 = time.time()
             if args.serial:
                 results = [fire(client, [c], timeout=400)[0] for c in calls]
@@ -261,6 +288,10 @@ def main() -> int:
                 results = fire(client, calls, timeout=400)
             stop.set()
             watcher.join()
+            if writer:
+                writer.join()
+                check(bool(write_results) and all(not r.get("isError") for r in write_results),
+                      f"round {rnd + 1}: concurrent script writes and scans finish", write_results)
             alive = proc.poll() is None
             check(alive, f"round {rnd + 1}: the editor survives {len(calls)} simultaneous imports",
                   f"exit code {proc.returncode}")

@@ -8,7 +8,7 @@ extends RefCounted
 ## Mixar works in: Blender (x, y, z) is Godot (x, z, -y), and a yaw about
 ## Blender's Z is the same angle about Godot's Y.
 
-const ADAPTER_VERSION := "0.5.1"
+const ADAPTER_VERSION := "0.5.3"
 ## Project settings the STUDIO sets (never the agent): "owned" (default, a
 ## Mixar-made game) or "plugin" (an existing project: Mixar keeps to
 ## res://mixar/, never edits project settings, and edits only levels under
@@ -18,6 +18,7 @@ const EDITABLE_SETTING := "mixar_link/editable_scenes"
 const MIXAR_DIR := "res://mixar"
 const Retarget := preload("res://addons/mixar_link/retarget.gd")
 const Toolsets := preload("res://addons/mixar_link/toolsets/registry.gd")
+const ImportPlugin := preload("res://addons/mixar_link/import_plugin.gd")
 const IMPORT_TIMEOUT_MS := 120000
 ## Idle frames an indexed package may stay unimported before the import counts as failed.
 const IMPORT_SETTLE_FRAMES := 30
@@ -65,6 +66,7 @@ var _scan_pending := false
 ## ("Task 'reimport' already exists") and can crash the editor.
 var _reimport_started_ms := 0
 var _reimport_end_frame := -1
+var _progress_dialogs: Array[Node] = []
 
 
 func _init(p_plugin: EditorPlugin, p_debugger: EditorDebuggerPlugin, p_log: Logger) -> void:
@@ -72,6 +74,7 @@ func _init(p_plugin: EditorPlugin, p_debugger: EditorDebuggerPlugin, p_log: Logg
 	debugger = p_debugger
 	log_buffer = p_log
 	toolsets = Toolsets.new(self)
+	_progress_dialogs = plugin.get_tree().root.find_children("*", "ProgressDialog", true, false)
 	var fs := EditorInterface.get_resource_filesystem()
 	fs.resources_reimporting.connect(_on_reimporting)
 	fs.resources_reimported.connect(_on_reimported)
@@ -104,6 +107,13 @@ func fs_busy() -> bool:
 	var fs := EditorInterface.get_resource_filesystem()
 	if fs.is_scanning() or fs.is_importing():
 		return true
+	# Godot's progress dialog runs nested process frames while registering
+	# script classes, when both filesystem flags can be false. Reimporting
+	# from one of those frames recursively clears the script-class worklist
+	# and crashes the editor. Wait for the native progress task to unwind.
+	for dialog in _progress_dialogs:
+		if is_instance_valid(dialog) and dialog is CanvasItem and dialog.is_visible_in_tree():
+			return true
 	# A reimport that never reported its end (an importer error) stops counting after 10 min.
 	if _reimport_started_ms != 0 and Time.get_ticks_msec() - _reimport_started_ms < 600000:
 		return true
@@ -580,6 +590,7 @@ func _place(args: Dictionary):
 	if inst is Node3D:
 		inst.position = _to_godot(position)
 		inst.rotation.y = deg_to_rad(float(args.get("yaw_deg", 0.0)))
+	var markers := _package_markers(path, inst)
 	var undo := plugin.get_undo_redo()
 	undo.create_action("Mixar: place " + String(inst.name))
 	undo.add_do_method(parent, "add_child", inst, true)
@@ -587,10 +598,54 @@ func _place(args: Dictionary):
 	undo.add_do_reference(inst)
 	undo.add_undo_method(parent, "remove_child", inst)
 	undo.commit_action()
+	for marker in markers:
+		marker.owner = root
 	EditorInterface.save_scene()
-	return _ok({"node": String(root.get_path_to(inst)), "type": inst.get_class(),
+	var data := {"node": String(root.get_path_to(inst)), "type": inst.get_class(),
 		"position": _to_blender((inst as Node3D).position) if inst is Node3D else null,
-		"scene": root.scene_file_path})
+		"scene": root.scene_file_path}
+	if not markers.is_empty():
+		data["markers"] = markers.map(func(m): return String(m.name))
+	return _ok(data)
+
+
+## The package's tagged empties (spawn points, a goal, triggers): the export
+## drops them from the file and lists them under the manifest's engine.markers,
+## so they are added here as Marker3D children of the placed package, with the
+## tags, groups and role script a tagged mesh gets on import. Without this a
+## goal made as an empty never reached the game (goals=0, uat7 2026-11-18).
+func _package_markers(scene_path: String, inst: Node) -> Array:
+	var made: Array = []
+	if not inst is Node3D:
+		return made
+	var manifest_path := scene_path.get_base_dir().path_join("manifest.json")
+	if not FileAccess.file_exists(manifest_path):
+		return made
+	var manifest = JSON.parse_string(FileAccess.get_file_as_string(manifest_path))
+	if typeof(manifest) != TYPE_DICTIONARY or typeof(manifest.get("engine")) != TYPE_DICTIONARY:
+		return made
+	var listed = manifest.engine.get("markers", [])
+	if typeof(listed) != TYPE_ARRAY:
+		return made
+	for entry in listed:
+		if typeof(entry) != TYPE_DICTIONARY or String(entry.get("role", "")) == "":
+			continue
+		var name := String(entry.get("name", "Marker")).validate_node_name()
+		if name == "" or inst.find_child(name, true, false) != null:
+			continue  # already in the file as a node of its own
+		var marker := Marker3D.new()
+		marker.name = name
+		var at = entry.get("position", [0, 0, 0])
+		marker.position = _to_godot(at if typeof(at) == TYPE_ARRAY and at.size() == 3 else [0, 0, 0])
+		marker.rotation.y = deg_to_rad(float(entry.get("yaw_deg", 0.0)))
+		var tags := {}
+		for key in entry:
+			if not String(key) in ["name", "position", "yaw_deg"]:
+				tags["mixar_" + String(key)] = String(entry[key])
+		ImportPlugin.apply_tags(marker, tags)
+		inst.add_child(marker, true)
+		made.append(marker)
+	return made
 
 
 func _scene_tree(args: Dictionary):
