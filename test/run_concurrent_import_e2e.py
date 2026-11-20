@@ -21,6 +21,7 @@ shows the queue, and the log has no corrupt read or recursive reimport.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -30,6 +31,7 @@ import tempfile
 import threading
 import time
 import zlib
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import run_e2e  # noqa: E402  (the shared client, launcher and check())
@@ -130,13 +132,21 @@ def fire(client, calls: list[tuple[str, dict]], timeout: float) -> list:
 
 
 def imported(project: str, folder: str, files: list[str]) -> list[str]:
-    """Files of res://mixar/<folder>/ that have no valid import yet."""
-    missing = []
-    for f in files:
-        sidecar = os.path.join(project, "mixar", folder, f + ".import")
-        if not os.path.isfile(sidecar) or "valid=false" in open(sidecar).read():
-            missing.append(f)
-    return missing
+    """Include a cache that still contains the preceding revision of a replaced asset."""
+    stale = []
+    for name in files:
+        source = Path(project, "mixar", folder, name)
+        sidecar = Path(str(source) + ".import")
+        path = f"res://mixar/{folder}/{name}"
+        path_hash = hashlib.md5(path.encode()).hexdigest()
+        checksum = Path(project, ".godot", "imported", f"{source.name}-{path_hash}.md5")
+        if not sidecar.is_file() or "valid=false" in sidecar.read_text() or not checksum.is_file():
+            stale.append(name)
+            continue
+        actual = hashlib.md5(source.read_bytes()).hexdigest()
+        if f'source_md5="{actual}"' not in checksum.read_text():
+            stale.append(name)
+    return stale
 
 
 class _Running:

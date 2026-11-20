@@ -8,7 +8,7 @@ extends RefCounted
 ## Mixar works in: Blender (x, y, z) is Godot (x, z, -y), and a yaw about
 ## Blender's Z is the same angle about Godot's Y.
 
-const ADAPTER_VERSION := "0.5.3"
+const ADAPTER_VERSION := "0.5.4"
 ## Project settings the STUDIO sets (never the agent): "owned" (default, a
 ## Mixar-made game) or "plugin" (an existing project: Mixar keeps to
 ## res://mixar/, never edits project settings, and edits only levels under
@@ -20,8 +20,6 @@ const Retarget := preload("res://addons/mixar_link/retarget.gd")
 const Toolsets := preload("res://addons/mixar_link/toolsets/registry.gd")
 const ImportPlugin := preload("res://addons/mixar_link/import_plugin.gd")
 const IMPORT_TIMEOUT_MS := 120000
-## Idle frames an indexed package may stay unimported before the import counts as failed.
-const IMPORT_SETTLE_FRAMES := 30
 const MAX_IMPORT_SCANS := 5
 ## Frames in a row the editor must be idle before the link scans or reimports.
 const IDLE_FRAMES := 3
@@ -56,6 +54,7 @@ var toolsets: RefCounted
 var _import_queue: Array = []
 var _import_running: Dictionary = {}
 var _import_seq := 0
+var _changed_inputs := {}  # existing inputs replaced by the active batch, awaiting editor confirmation
 var _recent_imports: Array = []
 var _scan_pending := false
 ## Inside reimport_files(), from its resources_reimporting signal to its
@@ -96,7 +95,9 @@ func _on_reimporting(_files: PackedStringArray) -> void:
 	_reimport_started_ms = Time.get_ticks_msec()
 
 
-func _on_reimported(_files: PackedStringArray) -> void:
+func _on_reimported(files: PackedStringArray) -> void:
+	for path in files:
+		_changed_inputs.erase(path)
 	_reimport_started_ms = 0
 	_reimport_end_frame = Engine.get_process_frames()
 
@@ -253,9 +254,9 @@ func _status() -> Dictionary:
 ##      importing, then, in that same frame, renames every file into
 ##      res://mixar/<folder>/ (atomic: the importer never sees a half-written
 ##      file), textures first and the main file last;
-##   4. scans once (scanning again if a scan already running dropped it). The
-##      scan's single reimport_files() imports the package in importer order:
-##      textures before the scene that uses them;
+##   4. when updating an existing model, imports its textures in a separate batch
+##      before replacing the model. This keeps Godot from hot-reloading a live
+##      PackedScene while its changed/new external textures are still importing;
 ##   5. answers only when the main file and every texture are imported.
 ## reimport_files() (a rig's retarget) runs only when the editor is idle, a
 ## frame after the scan, never from inside a filesystem signal.
@@ -286,6 +287,7 @@ func _import_package(args: Dictionary):
 	_import_running = ticket
 	# The inner function returns on every path, so the queue is always released.
 	var data: Dictionary = await _run_import(ticket, src, folder, main, manifest)
+	_changed_inputs.clear()
 	ticket["finished_ms"] = Time.get_ticks_msec()
 	if _import_running.get("id") == ticket.id:
 		_import_running = {}
@@ -331,54 +333,24 @@ func _run_import(ticket: Dictionary, src: String, folder: String, main: String, 
 	# Textures (and everything else) first, the main file last.
 	files.erase(main)
 	files.append(main)
-	if not await wait_fs_idle(deadline):
-		_remove_tree(stage)
-		data["error"] = "The editor was still scanning or importing after %d s; nothing was changed. Try again." % (
-			IMPORT_TIMEOUT_MS / 1000)
-		return data
-	# The editor is idle in this frame: move the whole package into place now.
-	var moved := _move_staged(stage, ProjectSettings.globalize_path(dest_res), files)
-	_remove_tree(stage)
-	if moved < 0:
-		data["error"] = "Moving the package into %s failed." % dest_res
-		return data
-	data["files_copied"] = moved
 	var wanted := _import_wanted(files, main)
-	var scans := 0
-	var reimported := false
-	var idle := 0
-	while Time.get_ticks_msec() < deadline:
-		if fs_busy():
-			idle = 0
-		else:
-			idle += 1
-			# Checked only after our own scan: the index may still call the
-			# files that were just replaced valid.
-			var state := _import_state(dest_res, wanted)
-			if scans > 0 and state == "imported":
-				break
-			if scans == 0:
-				fs.scan()  # the editor is idle: wait_fs_idle() just said so
-				scans += 1
-				idle = 0
-			elif idle >= IDLE_FRAMES:
-				if state == "unindexed" and scans < MAX_IMPORT_SCANS:
-					# A scan that was already running dropped ours.
-					fs.scan()
-					scans += 1
-					idle = 0
-				elif state == "pending" and not reimported:
-					# Indexed but not imported: the editor's own reimport skipped
-					# them (it ran inside another one). One reimport_files() for
-					# the package; it sorts textures before the scene.
-					fs.reimport_files(_import_pending(dest_res, wanted))
-					reimported = true
-					idle = 0
-				elif idle > IMPORT_SETTLE_FRAMES:
-					break  # idle, and still not imported: the importer failed
-		await tree.process_frame
-	var state_now := _import_state(dest_res, wanted)
-	var imported := state_now == "imported" and ResourceLoader.exists(main_res)
+	if FileAccess.file_exists(main_res):
+		var textures := wanted.duplicate()
+		textures.erase(main)
+		if not textures.is_empty():
+			if not await _install_batch(stage, dest_res, textures, textures, deadline):
+				_remove_tree(stage)
+				data["error"] = "The editor could not finish importing the textures for %s; read the import log." % main_res
+				return data
+			data["files_copied"] += textures.size()
+			for texture in textures:
+				files.erase(texture)
+			wanted = [main]
+	var finished := await _install_batch(stage, dest_res, files, wanted, deadline)
+	_remove_tree(stage)
+	var imported := finished and ResourceLoader.exists(main_res)
+	if finished:
+		data["files_copied"] += files.size()
 	data["imported"] = imported
 	data["main_scene"] = main_res if imported else ""
 	if imported:
@@ -401,9 +373,46 @@ func _run_import(ticket: Dictionary, src: String, folder: String, main: String, 
 		data["error"] = "The package was copied but %s did not import within %d s; read log for the importer's errors." % [
 			main_res, IMPORT_TIMEOUT_MS / 1000]
 	elif not imported:
-		data["error"] = "The package was copied but the editor could not import %s; read log for the importer's errors." % (
-			", ".join(_import_pending(dest_res, wanted)) if state_now == "pending" else main_res)
+		data["error"] = "The editor could not install or finish importing %s; read the import log." % main_res
 	return data
+
+
+## Files move while the editor is idle. A valid entry can still point to the
+## old asset; wait for Godot to confirm any input whose bytes changed.
+func _install_batch(stage: String, dest_res: String, files: Array, wanted: Array, deadline: int) -> bool:
+	if not await wait_fs_idle(deadline):
+		return false
+	_changed_inputs.clear()
+	for rel in wanted:
+		var dest := dest_res.path_join(rel)
+		if FileAccess.file_exists(dest) and FileAccess.get_md5(dest) != FileAccess.get_md5(stage.path_join(rel)):
+			_changed_inputs[dest] = true
+	if _move_staged(stage, ProjectSettings.globalize_path(dest_res), files) < 0:
+		return false
+	var fs := EditorInterface.get_resource_filesystem()
+	var tree := plugin.get_tree()
+	var scans := 1
+	var reimported := false
+	fs.scan()
+	while await wait_fs_idle(deadline, 8):
+		var state := _import_state(dest_res, wanted)
+		if state == "imported" and _changed_inputs.is_empty():
+			return true
+		if state == "unindexed" and scans < MAX_IMPORT_SCANS:
+			fs.scan()
+			scans += 1
+		elif state != "unindexed" and not reimported:
+			var pending := _import_pending(dest_res, wanted)
+			for path in _changed_inputs:
+				if path not in pending:
+					pending.append(path)
+			if not pending.is_empty():
+				fs.reimport_files(pending)
+			reimported = true
+		else:
+			return false
+		await tree.process_frame
+	return false
 
 
 ## Waits a frame at a time until the editor has been neither scanning nor
